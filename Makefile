@@ -1,9 +1,8 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
-LIBS = -lcurl
 
 cAI: cai.c
-	$(CC) $(CFLAGS) -o cAI cai.c $(LIBS)
+	$(CC) $(CFLAGS) -o cAI cai.c
 
 clean:
 	rm -f cAI

@@ -1,6 +1,6 @@
 /*
  * cAI — tiny terminal chat for SharkDeck / Linux.
- * OpenAI-compatible HTTP (xAI default). Needs libcurl.
+ * OpenAI-compatible HTTP (xAI default). Uses the curl CLI, not libcurl.
  *
  *   ./cAI                 # interactive
  *   ./cAI -k              # set / replace API key
@@ -9,7 +9,6 @@
  *   echo hi | ./cAI -q    # one shot from stdin
  */
 #define _GNU_SOURCE
-#include <curl/curl.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,11 +27,6 @@ static char base[256] = "https://api.x.ai/v1";
 static char hist_role[MAX_MSG][16];
 static char *hist_txt[MAX_MSG];
 static int nhist;
-
-struct Buf {
-    char *p;
-    size_t n, cap;
-};
 
 static char *home_dir(void)
 {
@@ -196,32 +190,7 @@ static char *build_req(void)
     return out;
 }
 
-static size_t wr(char *ptr, size_t sz, size_t nm, void *ud)
-{
-    struct Buf *b = ud;
-    size_t n = sz * nm;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 8192;
-        char *p;
-        while (cap < b->n + n + 1)
-            cap *= 2;
-        if (cap > MAX_BODY)
-            cap = MAX_BODY;
-        if (b->n + n + 1 > cap)
-            return 0;
-        p = realloc(b->p, cap);
-        if (!p)
-            return 0;
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, ptr, n);
-    b->n += n;
-    b->p[b->n] = 0;
-    return n;
-}
-
-/* pull first "content": "..." after "assistant" if present */
+/* last "content": "..." in the JSON */
 static char *extract_content(const char *js)
 {
     const char *p, *q, *as;
@@ -272,54 +241,88 @@ static char *extract_content(const char *js)
     return out;
 }
 
+static char *slurp(FILE *f)
+{
+    char *p = NULL;
+    size_t n = 0, cap = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (n + 2 > cap) {
+            cap = cap ? cap * 2 : 4096;
+            if (cap > MAX_BODY)
+                cap = MAX_BODY;
+            if (n + 2 > cap)
+                break;
+            p = realloc(p, cap);
+            if (!p)
+                return NULL;
+        }
+        p[n++] = (char)c;
+    }
+    if (p)
+        p[n] = 0;
+    return p;
+}
+
 static char *chat_once(char **err)
 {
-    CURL *c;
-    CURLcode rc;
-    struct Buf b = {0};
-    struct curl_slist *hdr = NULL;
-    char url[320], auth[300];
-    char *body, *reply = NULL;
-    long http = 0;
+    char reqp[] = "/tmp/cai-req.json";
+    char cmd[768], url[320];
+    char *body, *raw, *reply, *http;
+    FILE *f, *p;
 
+    if (access("/usr/bin/curl", X_OK) != 0 && access("/bin/curl", X_OK) != 0) {
+        *err = strdup("curl not installed. apt install curl");
+        return NULL;
+    }
     body = build_req();
     if (!body) {
         *err = strdup("oom");
         return NULL;
     }
-    snprintf(url, sizeof url, "%s/chat/completions", base);
-    snprintf(auth, sizeof auth, "Authorization: Bearer %s", key);
-
-    c = curl_easy_init();
-    hdr = curl_slist_append(hdr, "Content-Type: application/json");
-    hdr = curl_slist_append(hdr, auth);
-    curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
-    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wr);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 90L);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "cAI/1.0");
-    rc = curl_easy_perform(c);
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http);
-    curl_easy_cleanup(c);
-    curl_slist_free_all(hdr);
+    f = fopen(reqp, "w");
+    if (!f) {
+        free(body);
+        *err = strdup("cannot write /tmp/cai-req.json");
+        return NULL;
+    }
+    fputs(body, f);
+    fclose(f);
     free(body);
 
-    if (rc != CURLE_OK) {
-        *err = strdup(curl_easy_strerror(rc));
-        free(b.p);
+    snprintf(url, sizeof url, "%s/chat/completions", base);
+    snprintf(cmd, sizeof cmd,
+             "curl -sS --max-time 90 "
+             "-H 'Content-Type: application/json' "
+             "-H 'Authorization: Bearer %s' "
+             "-d @%s '%s' -w '\\nHTTP:%%{http_code}'",
+             key, reqp, url);
+    p = popen(cmd, "r");
+    if (!p) {
+        *err = strdup("popen curl failed");
         return NULL;
     }
-    if (http / 100 != 2) {
-        char tmp[256];
-        snprintf(tmp, sizeof tmp, "HTTP %ld: %.180s", http, b.p ? b.p : "");
-        *err = strdup(tmp);
-        free(b.p);
+    raw = slurp(p);
+    pclose(p);
+    unlink(reqp);
+    if (!raw) {
+        *err = strdup("empty curl output");
         return NULL;
     }
-    reply = extract_content(b.p ? b.p : "");
-    free(b.p);
+    http = strstr(raw, "\nHTTP:");
+    if (http) {
+        int code = atoi(http + 6);
+        *http = 0;
+        if (code / 100 != 2) {
+            char tmp[256];
+            snprintf(tmp, sizeof tmp, "HTTP %d: %.180s", code, raw);
+            *err = strdup(tmp);
+            free(raw);
+            return NULL;
+        }
+    }
+    reply = extract_content(raw);
+    free(raw);
     if (!reply)
         *err = strdup("no content in reply");
     return reply;
@@ -379,8 +382,6 @@ int main(int argc, char **argv)
         if (!ask_key())
             return 1;
     }
-
-    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     if (once) {
         size_t n = fread(line, 1, sizeof line - 1, stdin);
@@ -448,6 +449,5 @@ int main(int argc, char **argv)
         hist_add("assistant", r);
         free(r);
     }
-    curl_global_cleanup();
     return 0;
 }
