@@ -1,32 +1,33 @@
 /*
- * cAI — tiny terminal chat for SharkDeck / Linux.
- * OpenAI-compatible HTTP (xAI default). Uses the curl CLI, not libcurl.
+ * cAI — terminal chat for SharkDeck.
+ * Uses the curl program (no libcurl headers).
  *
- *   ./cAI                 # interactive
- *   ./cAI -k              # set / replace API key
- *   ./cAI -m grok-4       # model
- *   ./cAI -u URL          # base URL (no trailing slash)
- *   echo hi | ./cAI -q    # one shot from stdin
+ *   cAI              chat (setup wizard if no key yet)
+ *   cAI setup        enter / change API key
+ *   cAI -q           one prompt from stdin
  */
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
-#include <pwd.h>
+#include <unistd.h>
 
 #define MAX_MSG  24
 #define MAX_BODY (256 * 1024)
 #define MAX_LINE 4096
 
 static char key[256];
-static char model[64] = "grok-4";
+static char model[80] = "grok-4";
 static char base[256] = "https://api.x.ai/v1";
 static char hist_role[MAX_MSG][16];
 static char *hist_txt[MAX_MSG];
 static int nhist;
+
+static int set_base(const char *s);
+static void save_cfg(void);
 
 static char *home_dir(void)
 {
@@ -45,9 +46,11 @@ static void path_join(char *out, size_t n, const char *name)
 
 static void trim(char *s)
 {
-    char *e;
-    while (*s && isspace((unsigned char)*s))
-        memmove(s, s + 1, strlen(s));
+    char *a = s, *e;
+    while (*a && isspace((unsigned char)*a))
+        a++;
+    if (a != s)
+        memmove(s, a, strlen(a) + 1);
     e = s + strlen(s);
     while (e > s && isspace((unsigned char)e[-1]))
         *--e = 0;
@@ -78,34 +81,9 @@ static int save_file(const char *path, const char *s)
     return 1;
 }
 
-static void load_cfg(void)
-{
-    char p[512], line[320];
-    FILE *f;
-    path_join(p, sizeof p, ".cai.key");
-    load_file(p, key, sizeof key);
-    if (getenv("XAI_API_KEY") && getenv("XAI_API_KEY")[0])
-        snprintf(key, sizeof key, "%s", getenv("XAI_API_KEY"));
-    else if (getenv("OPENAI_API_KEY") && getenv("OPENAI_API_KEY")[0])
-        snprintf(key, sizeof key, "%s", getenv("OPENAI_API_KEY"));
-    path_join(p, sizeof p, ".cai.conf");
-    f = fopen(p, "r");
-    if (!f)
-        return;
-    while (fgets(line, sizeof line, f)) {
-        trim(line);
-        if (!strncmp(line, "model=", 6))
-            snprintf(model, sizeof model, "%s", line + 6);
-        else if (!strncmp(line, "base=", 5)) {
-            if (!set_base(line + 5))
-                snprintf(base, sizeof base, "https://api.x.ai/v1");
-        }
-    }
-    fclose(f);
-}
-
 static int set_base(const char *s)
 {
+    size_t n;
     if (!s || !*s)
         return 0;
     if (!strcmp(s, "URL") || !strcmp(s, "url") || !strcmp(s, "BASEURL"))
@@ -113,12 +91,9 @@ static int set_base(const char *s)
     if (strncmp(s, "http://", 7) && strncmp(s, "https://", 8))
         return 0;
     snprintf(base, sizeof base, "%s", s);
-    /* strip trailing slash */
-    {
-        size_t n = strlen(base);
-        while (n && base[n - 1] == '/')
-            base[--n] = 0;
-    }
+    n = strlen(base);
+    while (n && base[n - 1] == '/')
+        base[--n] = 0;
     return 1;
 }
 
@@ -134,24 +109,136 @@ static void save_cfg(void)
     fclose(f);
 }
 
-static int ask_key(void)
+static void load_cfg(void)
 {
-    char p[512], buf[256];
-    fprintf(stderr, "API key (xAI / OpenAI compatible): ");
-    fflush(stderr);
-    if (!fgets(buf, sizeof buf, stdin))
+    char p[512], line[320];
+    FILE *f;
+    const char *e;
+    path_join(p, sizeof p, ".cai.key");
+    load_file(p, key, sizeof key);
+    e = getenv("XAI_API_KEY");
+    if (e && e[0])
+        snprintf(key, sizeof key, "%s", e);
+    e = getenv("OPENAI_API_KEY");
+    if ((!key[0]) && e && e[0])
+        snprintf(key, sizeof key, "%s", e);
+    path_join(p, sizeof p, ".cai.conf");
+    f = fopen(p, "r");
+    if (!f)
+        return;
+    while (fgets(line, sizeof line, f)) {
+        trim(line);
+        if (!strncmp(line, "model=", 6))
+            snprintf(model, sizeof model, "%.*s", (int)sizeof model - 1, line + 6);
+        else if (!strncmp(line, "base=", 5)) {
+            if (!set_base(line + 5))
+                snprintf(base, sizeof base, "https://api.x.ai/v1");
+        }
+    }
+    fclose(f);
+}
+
+static void mask_key(char *out, size_t n)
+{
+    size_t k = strlen(key);
+    if (k == 0) {
+        snprintf(out, n, "(none)");
+        return;
+    }
+    if (k <= 8)
+        snprintf(out, n, "****%s", key + (k > 4 ? k - 4 : 0));
+    else
+        snprintf(out, n, "%.4s…%s", key, key + k - 4);
+}
+
+static int read_line(const char *prompt, char *dst, size_t n)
+{
+    printf("%s", prompt);
+    fflush(stdout);
+    if (!fgets(dst, (int)n, stdin))
         return 0;
-    trim(buf);
-    if (!buf[0])
+    trim(dst);
+    return 1;
+}
+
+static int save_key(const char *s)
+{
+    char p[512];
+    if (!s || !s[0])
         return 0;
-    snprintf(key, sizeof key, "%s", buf);
+    snprintf(key, sizeof key, "%s", s);
     path_join(p, sizeof p, ".cai.key");
     if (!save_file(p, key)) {
-        fprintf(stderr, "could not write %s\n", p);
+        printf("could not write %s\n", p);
         return 0;
     }
-    fprintf(stderr, "saved %s (mode 600)\n", p);
+    printf("key saved to %s (only you can read it)\n", p);
     return 1;
+}
+
+static void apply_preset(int n)
+{
+    if (n == 1) {
+        snprintf(base, sizeof base, "https://api.x.ai/v1");
+        snprintf(model, sizeof model, "grok-4");
+    } else if (n == 2) {
+        snprintf(base, sizeof base, "https://api.openai.com/v1");
+        snprintf(model, sizeof model, "gpt-4o-mini");
+    }
+}
+
+static int setup(void)
+{
+    char buf[256], shown[40];
+
+    puts("");
+    puts("======= cAI setup =======");
+    puts("1) xAI / Grok     https://api.x.ai/v1");
+    puts("2) OpenAI         https://api.openai.com/v1");
+    puts("3) keep current / custom");
+    if (!read_line("pick 1-3 [1]: ", buf, sizeof buf))
+        return 0;
+    if (!buf[0] || buf[0] == '1')
+        apply_preset(1);
+    else if (buf[0] == '2')
+        apply_preset(2);
+    else if (buf[0] == '3') {
+        printf("base now: %s\n", base);
+        if (read_line("new base (empty = keep): ", buf, sizeof buf) && buf[0]) {
+            if (!set_base(buf)) {
+                puts("need https://host/v1 — not the word URL");
+                return 0;
+            }
+        }
+        printf("model now: %s\n", model);
+        if (read_line("new model (empty = keep): ", buf, sizeof buf) && buf[0])
+            snprintf(model, sizeof model, "%.*s", (int)sizeof model - 1, buf);
+    } else {
+        puts("unknown pick");
+        return 0;
+    }
+
+    mask_key(shown, sizeof shown);
+    printf("current key: %s\n", shown);
+    puts("paste API key (empty keeps current):");
+    if (!read_line("key> ", buf, sizeof buf))
+        return 0;
+    if (buf[0]) {
+        /* strip accidental "Bearer " prefix */
+        if (!strncmp(buf, "Bearer ", 7))
+            memmove(buf, buf + 7, strlen(buf + 7) + 1);
+        if (!save_key(buf))
+            return 0;
+    } else if (!key[0]) {
+        puts("no key entered");
+        return 0;
+    }
+
+    save_cfg();
+    mask_key(shown, sizeof shown);
+    printf("ready. model=%s\n      base=%s\n      key=%s\n", model, base, shown);
+    puts("=========================");
+    return key[0] != 0;
 }
 
 static void hist_add(const char *role, const char *txt)
@@ -160,7 +247,7 @@ static void hist_add(const char *role, const char *txt)
     if (nhist == MAX_MSG) {
         free(hist_txt[0]);
         for (i = 1; i < MAX_MSG; i++) {
-            strcpy(hist_role[i - 1], hist_role[i]);
+            memcpy(hist_role[i - 1], hist_role[i], sizeof hist_role[0]);
             hist_txt[i - 1] = hist_txt[i];
         }
         nhist--;
@@ -198,7 +285,8 @@ static char *build_req(void)
     if (!f)
         return NULL;
     fprintf(f, "{\"model\":\"%s\",\"temperature\":0.7,\"messages\":[", model);
-    fprintf(f, "{\"role\":\"system\",\"content\":\"You are cAI, a terse assistant on a small Linux handheld. Keep answers short unless asked.\"}");
+    fprintf(f,
+            "{\"role\":\"system\",\"content\":\"You are cAI on a small Linux handheld. Keep answers short unless asked.\"}");
     for (i = 0; i < nhist; i++) {
         fputc(',', f);
         fprintf(f, "{\"role\":\"%s\",\"content\":\"", hist_role[i]);
@@ -210,16 +298,13 @@ static char *build_req(void)
     return out;
 }
 
-/* last "content": "..." in the JSON */
 static char *extract_content(const char *js)
 {
-    const char *p, *q, *as;
+    const char *p, *q;
     char *out;
     size_t i, n;
-    as = strstr(js, "\"role\"");
-    p = js;
-    /* last content field is usually the assistant reply */
     q = NULL;
+    p = js;
     while ((p = strstr(p, "\"content\"")) != NULL) {
         q = p;
         p += 9;
@@ -249,7 +334,7 @@ static char *extract_content(const char *js)
             else if (q[i] == 't')
                 out[n++] = '\t';
             else if (q[i] == 'u' && strlen(q + i) >= 5)
-                i += 4; /* skip \uXXXX */
+                i += 4;
             else
                 out[n++] = q[i];
         } else if (q[i] == '"')
@@ -284,15 +369,25 @@ static char *slurp(FILE *f)
     return p;
 }
 
+static char *find_curl(void)
+{
+    if (access("/usr/bin/curl", X_OK) == 0)
+        return "/usr/bin/curl";
+    if (access("/bin/curl", X_OK) == 0)
+        return "/bin/curl";
+    return NULL;
+}
+
 static char *chat_once(char **err)
 {
     char reqp[] = "/tmp/cai-req.json";
-    char cmd[768], url[320];
-    char *body, *raw, *reply, *http;
+    char cmd[900], url[360];
+    char *body, *raw, *reply, *http, *curlbin;
     FILE *f, *p;
 
-    if (access("/usr/bin/curl", X_OK) != 0 && access("/bin/curl", X_OK) != 0) {
-        *err = strdup("curl not installed. apt install curl");
+    curlbin = find_curl();
+    if (!curlbin) {
+        *err = strdup("install curl:  apt install curl");
         return NULL;
     }
     body = build_req();
@@ -312,11 +407,11 @@ static char *chat_once(char **err)
 
     snprintf(url, sizeof url, "%s/chat/completions", base);
     snprintf(cmd, sizeof cmd,
-             "curl -sS --max-time 90 "
+             "%s -sS --max-time 90 "
              "-H 'Content-Type: application/json' "
              "-H 'Authorization: Bearer %s' "
              "-d @%s '%s' -w '\\nHTTP:%%{http_code}'",
-             key, reqp, url);
+             curlbin, key, reqp, url);
     p = popen(cmd, "r");
     if (!p) {
         *err = strdup("popen curl failed");
@@ -334,8 +429,8 @@ static char *chat_once(char **err)
         int code = atoi(http + 6);
         *http = 0;
         if (code / 100 != 2) {
-            char tmp[256];
-            snprintf(tmp, sizeof tmp, "HTTP %d %s: %.160s", code, url, raw);
+            char tmp[280];
+            snprintf(tmp, sizeof tmp, "HTTP %d %s\n%.200s", code, url, raw);
             *err = strdup(tmp);
             free(raw);
             return NULL;
@@ -344,66 +439,65 @@ static char *chat_once(char **err)
     reply = extract_content(raw);
     free(raw);
     if (!reply)
-        *err = strdup("no content in reply");
+        *err = strdup("no content in reply (bad key or model?)");
     return reply;
 }
 
 static void banner(void)
 {
-    printf("cAI  model=%s  base=%s\n", model, base);
-    printf("commands: /quit  /clear  /key  /model grok-4\n");
-    printf("          /base https://api.x.ai/v1\n\n");
+    char shown[40];
+    mask_key(shown, sizeof shown);
+    printf("cAI  %s\n", model);
+    printf("     %s\n", base);
+    printf("     key %s\n", shown);
+    puts("type a message, or:  setup  /clear  /quit");
+    puts("");
 }
 
 static void usage(void)
 {
-    fprintf(stderr,
-            "cAI — tiny chat (OpenAI-compatible)\n"
-            "  cAI            chat\n"
-            "  cAI -k         set API key\n"
-            "  cAI -m MODEL   (default grok-4)\n"
-            "  cAI -u URL     base URL, default https://api.x.ai/v1\n"
-            "  cAI -q         one prompt from stdin, print reply\n"
-            "key file: ~/.cai.key   conf: ~/.cai.conf\n"
-            "env: XAI_API_KEY or OPENAI_API_KEY overrides the file\n");
+    fputs(
+        "cAI — tiny chat\n"
+        "  cAI           start chat (asks for key the first time)\n"
+        "  cAI setup     change key / provider\n"
+        "  cAI -q        one prompt from stdin\n",
+        stderr);
 }
 
 int main(int argc, char **argv)
 {
-    int opt, once = 0, setkey = 0;
+    int once = 0, i;
     char line[MAX_LINE];
 
     load_cfg();
-    while ((opt = getopt(argc, argv, "hkm:u:q")) != -1) {
-        switch (opt) {
-        case 'k':
-            setkey = 1;
-            break;
-        case 'm':
-            snprintf(model, sizeof model, "%s", optarg);
+
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            usage();
+            return 0;
+        }
+        if (!strcmp(argv[i], "-q"))
+            once = 1;
+        else if (!strcmp(argv[i], "setup") || !strcmp(argv[i], "-k") || !strcmp(argv[i], "--setup")) {
+            return setup() ? 0 : 1;
+        } else if (!strcmp(argv[i], "-m") && i + 1 < argc) {
+            snprintf(model, sizeof model, "%s", argv[++i]);
             save_cfg();
-            break;
-        case 'u':
-            if (!set_base(optarg)) {
-                fprintf(stderr, "bad base (need https://api.x.ai/v1, not the word URL)\n");
+        } else if (!strcmp(argv[i], "-u") && i + 1 < argc) {
+            if (!set_base(argv[++i])) {
+                fputs("base must look like https://api.x.ai/v1\n", stderr);
                 return 1;
             }
             save_cfg();
-            break;
-        case 'q':
-            once = 1;
-            break;
-        default:
+        } else {
             usage();
             return 1;
         }
     }
-    if (setkey) {
-        return ask_key() ? 0 : 1;
-    }
+
     if (!key[0]) {
-        fprintf(stderr, "no API key. run: cAI -k\n");
-        if (!ask_key())
+        puts("no API key saved yet.");
+        if (!setup())
             return 1;
     }
 
@@ -436,7 +530,7 @@ int main(int argc, char **argv)
         trim(line);
         if (!line[0])
             continue;
-        if (!strcmp(line, "/quit") || !strcmp(line, "/q") || !strcmp(line, "/exit"))
+        if (!strcmp(line, "/quit") || !strcmp(line, "/q") || !strcmp(line, "/exit") || !strcmp(line, "quit"))
             break;
         if (!strcmp(line, "/clear")) {
             while (nhist)
@@ -444,19 +538,19 @@ int main(int argc, char **argv)
             puts("(cleared)");
             continue;
         }
-        if (!strcmp(line, "/key")) {
-            ask_key();
+        if (!strcmp(line, "setup") || !strcmp(line, "/setup") || !strcmp(line, "/key")) {
+            setup();
             continue;
         }
         if (!strncmp(line, "/model ", 7)) {
-            snprintf(model, sizeof model, "%s", line + 7);
+            snprintf(model, sizeof model, "%.*s", (int)sizeof model - 1, line + 7);
             save_cfg();
             printf("model=%s\n", model);
             continue;
         }
         if (!strncmp(line, "/base ", 6)) {
             if (!set_base(line + 6))
-                puts("need a real URL, e.g. /base https://api.x.ai/v1");
+                puts("need https://host/v1");
             else {
                 save_cfg();
                 printf("base=%s\n", base);

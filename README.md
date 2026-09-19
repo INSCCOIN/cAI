@@ -1,49 +1,42 @@
 # cAI
 
-Tiny terminal chat for SharkDeck. Talks to an **OpenAI-compatible** HTTP API (xAI by default).
+Tiny terminal chat. Uses the **curl program**, not libcurl headers.
 
 ## Build
 
 ```bash
-sudo apt install -y libcurl4-openssl-dev
+sudo apt install -y curl
 cd /home/working/cAI
+rm -f cAI *.o
 make
 sudo install -m 755 cAI /usr/local/bin/cAI
 ```
 
-## First run
+## Use
 
 ```bash
-cAI -k          # paste API key, stored in ~/.cai.key (0600)
-cAI             # chat
-```
-
-Or:
-
-```bash
-export XAI_API_KEY=xai-...
 cAI
 ```
 
-`XAI_API_KEY` / `OPENAI_API_KEY` override the file.
+First launch opens **setup**:
 
-## Commands in chat
+1. pick provider (`1` = xAI/Grok, `2` = OpenAI)
+2. paste the API key
 
-| | |
-|--|--|
-| `/quit` | leave |
-| `/clear` | drop history |
-| `/key` | replace key |
-| `/model grok-4` | switch model (saved) |
-| `/base https://api.x.ai/v1` | switch endpoint (saved) |
+Key is stored in `~/.cai.key` (mode 600). Provider is stored in `~/.cai.conf`.
+
+Change later:
+
+```bash
+cAI setup
+```
+
+or type `setup` inside the chat.
+
+In chat: `setup`  `/clear`  `/quit`
 
 One-shot:
 
 ```bash
 echo "what is 2+2" | cAI -q
 ```
-
-Flags: `-m MODEL` `-u BASEURL` `-q` `-k`
-
-Config: `~/.cai.conf`  
-Default model `grok-4`, default base `https://api.x.ai/v1`.
