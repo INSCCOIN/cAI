@@ -96,10 +96,30 @@ static void load_cfg(void)
         trim(line);
         if (!strncmp(line, "model=", 6))
             snprintf(model, sizeof model, "%s", line + 6);
-        else if (!strncmp(line, "base=", 5))
-            snprintf(base, sizeof base, "%s", line + 5);
+        else if (!strncmp(line, "base=", 5)) {
+            if (!set_base(line + 5))
+                snprintf(base, sizeof base, "https://api.x.ai/v1");
+        }
     }
     fclose(f);
+}
+
+static int set_base(const char *s)
+{
+    if (!s || !*s)
+        return 0;
+    if (!strcmp(s, "URL") || !strcmp(s, "url") || !strcmp(s, "BASEURL"))
+        return 0;
+    if (strncmp(s, "http://", 7) && strncmp(s, "https://", 8))
+        return 0;
+    snprintf(base, sizeof base, "%s", s);
+    /* strip trailing slash */
+    {
+        size_t n = strlen(base);
+        while (n && base[n - 1] == '/')
+            base[--n] = 0;
+    }
+    return 1;
 }
 
 static void save_cfg(void)
@@ -315,7 +335,7 @@ static char *chat_once(char **err)
         *http = 0;
         if (code / 100 != 2) {
             char tmp[256];
-            snprintf(tmp, sizeof tmp, "HTTP %d: %.180s", code, raw);
+            snprintf(tmp, sizeof tmp, "HTTP %d %s: %.160s", code, url, raw);
             *err = strdup(tmp);
             free(raw);
             return NULL;
@@ -331,7 +351,8 @@ static char *chat_once(char **err)
 static void banner(void)
 {
     printf("cAI  model=%s  base=%s\n", model, base);
-    printf("commands: /quit  /clear  /key  /model NAME  /base URL\n\n");
+    printf("commands: /quit  /clear  /key  /model grok-4\n");
+    printf("          /base https://api.x.ai/v1\n\n");
 }
 
 static void usage(void)
@@ -363,7 +384,10 @@ int main(int argc, char **argv)
             save_cfg();
             break;
         case 'u':
-            snprintf(base, sizeof base, "%s", optarg);
+            if (!set_base(optarg)) {
+                fprintf(stderr, "bad base (need https://api.x.ai/v1, not the word URL)\n");
+                return 1;
+            }
             save_cfg();
             break;
         case 'q':
@@ -431,9 +455,12 @@ int main(int argc, char **argv)
             continue;
         }
         if (!strncmp(line, "/base ", 6)) {
-            snprintf(base, sizeof base, "%s", line + 6);
-            save_cfg();
-            printf("base=%s\n", base);
+            if (!set_base(line + 6))
+                puts("need a real URL, e.g. /base https://api.x.ai/v1");
+            else {
+                save_cfg();
+                printf("base=%s\n", base);
+            }
             continue;
         }
         hist_add("user", line);
